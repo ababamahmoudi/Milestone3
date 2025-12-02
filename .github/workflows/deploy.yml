@@ -1,0 +1,20 @@
+;name: Deployment Pipeline
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Manual deployment notice
+        run: |
+          echo "Azure deployment is performed manually through the Azure Portal."
+          echo "Reason: Subscription-level role assignments are restricted in the Seneca Azure Lab environment."
+          echo "This workflow exists to demonstrate the deployment stage of CI/CD."
+
