@@ -1,17 +1,19 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from azure.cosmos import CosmosClient, exceptions
+from jose import jwt, JWTError
 import os
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
-app = FastAPI(title="CloudMart API", version="1.1.0")
+app = FastAPI(title="CloudMart API", version="1.2.0")
 
 BUILD_TIME = datetime.utcnow().isoformat()
 
-# CORS (for browser access if needed)
+# -------------------- CORS -------------------- #
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,7 +21,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Cosmos DB configuration (provided via environment variables)
+# -------------------- Cosmos DB -------------------- #
+
 COSMOS_ENDPOINT = os.environ.get("COSMOS_ENDPOINT", "")
 COSMOS_KEY = os.environ.get("COSMOS_KEY", "")
 DATABASE_NAME = "cloudmart"
@@ -149,6 +152,43 @@ def seed_products():
 async def startup_event():
     init_cosmos()
 
+# -------------------- JWT AUTH -------------------- #
+
+DEMO_USERNAME = "demo"
+DEMO_PASSWORD = "demo123"
+
+JWT_SECRET_KEY = os.environ.get("JWT_SECRET_KEY", "cloudmart-dev-secret-key")
+JWT_ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+    return encoded_jwt
+
+
+def get_current_user(authorization: str = Header(None)) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    token = authorization.split(" ", 1)[1]
+    try:
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise HTTPException(status_code=401, detail="Invalid token payload")
+        return username
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
 
 class CartItem(BaseModel):
     product_id: str
@@ -156,7 +196,6 @@ class CartItem(BaseModel):
 
 
 DEFAULT_USER = "demo_user"
-
 
 # -------------------- HTML FRONTEND -------------------- #
 
@@ -326,8 +365,16 @@ body {
 .btn-primary:hover {
   background:#4338ca;
 }
-
-/* Cart modal */
+.btn-outline {
+  padding:6px 10px;
+  border-radius:999px;
+  border:1px solid rgba(156,163,175,0.7);
+  font-size:13px;
+  cursor:pointer;
+  font-weight:500;
+  background:transparent;
+  color:#e5e7eb;
+}
 .cart-modal-backdrop {
   position:fixed;
   inset:0;
@@ -343,7 +390,7 @@ body {
   border-radius:16px;
   padding:18px;
   width:100%;
-  max-width:480px;
+  max-width:420px;
   border:1px solid rgba(75,85,99,0.8);
 }
 .cart-header-row {
@@ -351,60 +398,38 @@ body {
   justify-content:space-between;
   align-items:center;
 }
-.cart-total-row {
-  margin-top:10px;
-  display:flex;
-  justify-content:space-between;
-  font-weight:600;
-}
-
-/* --- CART FIXED CSS --- */
 .cart-items {
   margin-top:12px;
   max-height:300px;
   overflow-y:auto;
 }
-
 .cart-item {
   display:grid;
   grid-template-columns:1fr auto auto auto;
   align-items:center;
   gap:12px;
-  padding:12px 0;
-  border-bottom:1px solid rgba(31,41,55,0.6);
+  padding:10px 0;
+  border-bottom:1px solid rgba(31,41,55,0.9);
 }
-
 .cart-product {
-  color:#e5e7eb;
-  font-weight: 500;
   display:flex;
   flex-direction:column;
-  font-size:14px;
 }
-
-.cart-product small {
-  font-size:12px;
-  color:#9ca3af;
+.cart-item-price {
+  min-width:70px;
+  text-align:right;
+  color:#e5e7eb;
 }
-
-.cart-qty-controls {
-  display:flex;
-  align-items:center;
-  gap:6px;
-}
-
 .cart-item-qty {
   min-width:20px;
   text-align:center;
   display:inline-block;
 }
-
-.cart-item-price {
-  min-width:80px;
-  text-align:right;
-  color:#e5e7eb;
+.cart-qty-controls {
+  display:flex;
+  align-items:center;
+  gap:6px;
 }
-
 .qty-btn {
   width:22px;
   height:22px;
@@ -414,18 +439,12 @@ body {
   color:#e5e7eb;
   cursor:pointer;
 }
-
-.remove-btn {
-  background:#1f2937;
-  color:#e5e7eb;
-  border:none;
-  border-radius:999px;
-  width:24px;
-  height:24px;
-  cursor:pointer;
+.cart-total-row {
+  margin-top:10px;
+  display:flex;
+  justify-content:space-between;
+  font-weight:600;
 }
-
-/* toast */
 .toast {
   position:fixed;
   bottom:18px;
@@ -449,26 +468,27 @@ small.build {
   color:#6b7280;
 }
 .cart-header-row h3 {
-    color: #e5e7eb; /* bright white-gray */
-    font-weight: 600;
+  color:#e5e7eb;
+  font-weight:600;
 }
-.cart-modal span {
-    color: #e5e7eb;
-}
-.cart-product div {
-    color: #e5e7eb;
-    font-size: 14px;
-    font-weight: 500;
-}
-.cart-total-row span {
-    color: #e5e7eb;
-    font-size: 15px;
+.cart-modal > div span {
+  color:#e5e7eb;
+  font-weight:500;
 }
 #cartTotal {
-    color: #a5b4fc; /* same purple as product prices */
-    font-weight: 700;
+  color:#a5b4fc;
+  font-weight:700;
 }
-
+.search-input {
+  width:100%;
+  padding:8px 10px;
+  border-radius:8px;
+  border:1px solid rgba(75,85,99,0.9);
+  background:#020617;
+  color:#e5e7eb;
+  font-size:13px;
+  margin-top:12px;
+}
 </style>
 </head>
 <body>
@@ -478,7 +498,10 @@ small.build {
       <div class="logo">Cloud<span>Mart</span><span class="db-badge">🗄️ Cosmos DB</span></div>
       <div class="subtitle">CI/CD: GitHub Actions → Docker Hub → Azure Container Instances</div>
     </div>
-    <button class="cart-btn" onclick="openCart()">🛒 Cart <span id="cartCount" class="cart-count">0</span></button>
+    <div style="display:flex;align-items:center;gap:8px;">
+      <button class="btn-outline" id="loginBtn" onclick="openLogin()">Login</button>
+      <button class="cart-btn" onclick="openCart()">🛒 Cart <span id="cartCount" class="cart-count">0</span></button>
+    </div>
   </div>
 </header>
 
@@ -496,20 +519,27 @@ small.build {
     </div>
   </div>
 
-  <div class="chip-row" id="categoryChips"></div>
-  <div class="product-grid" id="productGrid"></div>
+  <div class="chip-row" id="categoryChips">
+  </div>
+
+  <div>
+    <input id="searchBox" class="search-input" type="text"
+      placeholder="Search products by name or category..."
+      oninput="searchProducts()" />
+  </div>
+
+  <div class="product-grid" id="productGrid">
+  </div>
 </main>
 
 <!-- CART MODAL -->
 <div class="cart-modal-backdrop" id="cartModal">
   <div class="cart-modal">
-
     <div class="cart-header-row">
       <h3>Shopping Cart</h3>
       <button class="qty-btn" onclick="closeCart()">✕</button>
     </div>
 
-    <!-- Column Titles -->
     <div style="
       display:grid;
       grid-template-columns:1fr auto auto auto;
@@ -525,20 +555,50 @@ small.build {
       <span></span>
     </div>
 
-    <!-- Dynamic cart rows -->
     <div class="cart-items" id="cartItems"></div>
 
-    <!-- Total row -->
     <div class="cart-total-row">
       <span>Total</span>
       <span id="cartTotal">$0.00</span>
     </div>
 
-    <!-- Footer buttons -->
     <div style="margin-top:12px;display:flex;justify-content:flex-end;gap:8px;">
       <button class="btn" onclick="closeCart()">Close</button>
       <button class="btn btn-primary" onclick="placeOrder()">Place Order</button>
     </div>
+  </div>
+</div>
+
+<!-- LOGIN MODAL -->
+<div class="cart-modal-backdrop" id="loginModal">
+  <div class="cart-modal">
+    <div class="cart-header-row">
+      <h3>Login</h3>
+      <button class="qty-btn" onclick="closeLogin()">✕</button>
+    </div>
+    <form onsubmit="performLogin(event)" style="margin-top:12px;display:flex;flex-direction:column;gap:8px;">
+      <div>
+        <label style="font-size:12px;color:#9ca3af;">Username</label>
+        <input id="loginUsername" type="text" value="demo"
+          style="width:100%;margin-top:4px;padding:6px 8px;border-radius:8px;
+                 border:1px solid rgba(75,85,99,0.9);background:#020617;
+                 color:#e5e7eb;font-size:13px;">
+      </div>
+      <div>
+        <label style="font-size:12px;color:#9ca3af;">Password</label>
+        <input id="loginPassword" type="password" value="demo123"
+          style="width:100%;margin-top:4px;padding:6px 8px;border-radius:8px;
+                 border:1px solid rgba(75,85,99,0.9);background:#020617;
+                 color:#e5e7eb;font-size:13px;">
+      </div>
+      <div style="margin-top:10px;display:flex;justify-content:flex-end;gap:8px;">
+        <button type="button" class="btn" onclick="closeLogin()">Cancel</button>
+        <button type="submit" class="btn btn-primary">Login</button>
+      </div>
+    </form>
+    <p style="margin-top:8px;font-size:11px;color:#6b7280;">
+      Demo credentials: demo / demo123
+    </p>
   </div>
 </div>
 
@@ -548,10 +608,20 @@ small.build {
 let products = [];
 let categories = [];
 let cart = [];
+let authToken = null;
 
 async function fetchJSON(url, options) {
-  const res = await fetch(url, options || {});
-  if (!res.ok) throw new Error("HTTP " + res.status);
+  const opts = options || {};
+  opts.headers = opts.headers || {};
+
+  if (authToken) {
+    opts.headers["Authorization"] = "Bearer " + authToken;
+  }
+
+  const res = await fetch(url, opts);
+  if (!res.ok) {
+    throw new Error("HTTP " + res.status);
+  }
   return res.json();
 }
 
@@ -568,12 +638,33 @@ async function loadHealth() {
   }
 }
 
+function updateAuthUI() {
+  const btn = document.getElementById("loginBtn");
+  if (!btn) return;
+  if (authToken) {
+    btn.textContent = "Logout";
+  } else {
+    btn.textContent = "Login";
+  }
+}
+
 async function init() {
+  authToken = localStorage.getItem("cloudmart_token") || null;
+  updateAuthUI();
+
   await loadHealth();
   try {
     products = await fetchJSON("/api/v1/products");
     categories = await fetchJSON("/api/v1/categories");
-    cart = await fetchJSON("/api/v1/cart");
+    if (authToken) {
+      try {
+        cart = await fetchJSON("/api/v1/cart");
+      } catch (e) {
+        cart = [];
+      }
+    } else {
+      cart = [];
+    }
   } catch (e) {
     showToast("Failed to load data from API", true);
   }
@@ -618,7 +709,7 @@ function renderProducts(filtered) {
       <div class="card-desc">${p.description}</div>
       <div class="card-footer">
         <div>
-          <div class="price">$${p.price.toFixed(2)}</div>
+          <div class="price">$${Number(p.price).toFixed(2)}</div>
           <div class="stock">${p.stock} in stock</div>
         </div>
         <button class="btn btn-primary" data-id="${p.id}">Add to cart</button>
@@ -646,13 +737,45 @@ function filterCategory(category) {
   renderProducts(products.filter(p => p.category === category));
 }
 
+async function searchProducts() {
+  const box = document.getElementById("searchBox");
+  if (!box) return;
+  const q = box.value.trim();
+
+  if (q.length === 0) {
+    // Restore based on active category
+    const activeChip = document.querySelector(".chip.active");
+    if (!activeChip || activeChip.textContent === "All products") {
+      renderProducts();
+    } else {
+      const cat = activeChip.textContent;
+      renderProducts(products.filter(p => p.category === cat));
+    }
+    return;
+  }
+
+  try {
+    const results = await fetchJSON("/api/v1/search?q=" + encodeURIComponent(q));
+    renderProducts(results);
+  } catch (e) {
+    showToast("Search failed", true);
+  }
+}
+
 function updateCartCount() {
-  // count total quantity in cart
-  const totalItems = cart.reduce((sum, item) => sum + (Number(item.quantity) || 0), 0);
-  document.getElementById("cartCount").textContent = totalItems;
+  document.getElementById("cartCount").textContent = cart.length;
+}
+
+function requireLogin() {
+  showToast("Please log in to use cart and orders", true);
+  openLogin();
 }
 
 function openCart() {
+  if (!authToken) {
+    requireLogin();
+    return;
+  }
   renderCart();
   document.getElementById("cartModal").style.display = "flex";
 }
@@ -685,7 +808,7 @@ function renderCart() {
     row.innerHTML = `
       <div class="cart-product">
         <div>${item.name}</div>
-        <small>$${price.toFixed(2)} each</small>
+        <div style="font-size:12px;color:#6b7280;">$${price.toFixed(2)} each</div>
       </div>
 
       <div class="cart-qty-controls">
@@ -696,10 +819,9 @@ function renderCart() {
 
       <div class="cart-item-price">$${lineTotal.toFixed(2)}</div>
 
-      <button class="remove-btn">✕</button>
+      <button class="qty-btn remove-btn">✕</button>
     `;
 
-    // Decrease
     row.querySelector(".dec").onclick = () => {
       if (qty <= 1) {
         removeFromCart(item.id);
@@ -708,12 +830,10 @@ function renderCart() {
       }
     };
 
-    // Increase
     row.querySelector(".inc").onclick = () => {
       updateCartQuantity(item.id, qty + 1);
     };
 
-    // Remove button
     row.querySelector(".remove-btn").onclick = () => {
       removeFromCart(item.id);
     };
@@ -725,6 +845,10 @@ function renderCart() {
 }
 
 async function addToCart(productId, quantity) {
+  if (!authToken) {
+    requireLogin();
+    return;
+  }
   try {
     await fetchJSON("/api/v1/cart/items", {
       method: "POST",
@@ -740,11 +864,19 @@ async function addToCart(productId, quantity) {
 }
 
 async function updateCartQuantity(productId, quantity) {
+  if (!authToken) {
+    requireLogin();
+    return;
+  }
   await addToCart(productId, quantity);
   renderCart();
 }
 
 async function removeFromCart(productId) {
+  if (!authToken) {
+    requireLogin();
+    return;
+  }
   try {
     await fetchJSON("/api/v1/cart/items/" + productId, {
       method: "DELETE",
@@ -759,6 +891,10 @@ async function removeFromCart(productId) {
 }
 
 async function placeOrder() {
+  if (!authToken) {
+    requireLogin();
+    return;
+  }
   if (cart.length === 0) {
     showToast("Cart is empty", true);
     return;
@@ -779,6 +915,66 @@ async function placeOrder() {
   }
 }
 
+function openLogin() {
+  // If already logged in, clicking acts as logout
+  if (authToken) {
+    authToken = null;
+    localStorage.removeItem("cloudmart_token");
+    cart = [];
+    updateCartCount();
+    updateAuthUI();
+    showToast("Logged out");
+    return;
+  }
+  document.getElementById("loginModal").style.display = "flex";
+}
+
+function closeLogin() {
+  document.getElementById("loginModal").style.display = "none";
+}
+
+async function performLogin(event) {
+  event.preventDefault();
+  const u = document.getElementById("loginUsername").value.trim();
+  const p = document.getElementById("loginPassword").value.trim();
+
+  if (!u || !p) {
+    showToast("Please enter username and password", true);
+    return;
+  }
+
+  try {
+    const res = await fetch("/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: u, password: p }),
+    });
+
+    if (!res.ok) {
+      showToast("Invalid credentials", true);
+      return;
+    }
+
+    const data = await res.json();
+    authToken = data.access_token;
+    localStorage.setItem("cloudmart_token", authToken);
+    updateAuthUI();
+    closeLogin();
+
+    // Reload cart from API now that we're authenticated
+    try {
+      cart = await fetchJSON("/api/v1/cart");
+      updateCartCount();
+    } catch (e) {
+      cart = [];
+    }
+
+    showToast("Logged in successfully");
+  } catch (e) {
+    showToast("Login failed", true);
+  }
+}
+
 let toastTimeout;
 function showToast(message, isError) {
   const t = document.getElementById("toast");
@@ -795,7 +991,6 @@ init();
 </html>
 """
 
-
 # -------------------- ROUTES -------------------- #
 
 @app.get("/", response_class=HTMLResponse)
@@ -809,17 +1004,27 @@ def health():
     return {
         "status": "healthy",
         "service": "cloudmart-api",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "build_time": BUILD_TIME,
         "database": "cosmos-db",
         "db_status": db_status,
-        "deployed_via": "local-dev",
+        "deployed_via": "aci-container",
     }
+
+
+@app.post("/auth/login")
+def auth_login(body: LoginRequest):
+    if body.username != DEMO_USERNAME or body.password != DEMO_PASSWORD:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    token = create_access_token({"sub": body.username})
+    return {"access_token": token, "token_type": "bearer"}
 
 
 @app.get("/api/v1/products")
 def list_products(category: str | None = None):
     if not products_container:
+        # running without DB
         return []
     try:
         if category:
@@ -837,6 +1042,31 @@ def list_products(category: str | None = None):
                     "SELECT * FROM c", enable_cross_partition_query=True
                 )
             )
+        return items
+    except Exception:
+        return []
+
+
+@app.get("/api/v1/search")
+def search_products(q: str):
+    """
+    Simple search endpoint: searches in product name and category.
+    """
+    if not products_container:
+        return []
+    try:
+        query = (
+            "SELECT * FROM c "
+            "WHERE CONTAINS(c.name, @q) "
+            "OR CONTAINS(c.category, @q)"
+        )
+        items = list(
+            products_container.query_items(
+                query,
+                parameters=[{"name": "@q", "value": q}],
+                enable_cross_partition_query=True,
+            )
+        )
         return items
     except Exception:
         return []
@@ -878,7 +1108,7 @@ def get_categories():
 
 
 @app.get("/api/v1/cart")
-def get_cart():
+def get_cart(current_user: str = Depends(get_current_user)):
     if not cart_container or not products_container:
         return []
 
@@ -892,7 +1122,6 @@ def get_cart():
         )
 
         enriched_cart = []
-
         for item in items:
             product_items = list(
                 products_container.query_items(
@@ -901,12 +1130,10 @@ def get_cart():
                     enable_cross_partition_query=True,
                 )
             )
-
             if not product_items:
                 continue
 
             product = product_items[0]
-
             enriched_cart.append(
                 {
                     "id": product["id"],
@@ -925,7 +1152,7 @@ def get_cart():
 
 
 @app.post("/api/v1/cart/items")
-def add_to_cart(item: CartItem):
+def add_to_cart(item: CartItem, current_user: str = Depends(get_current_user)):
     if not cart_container:
         return {"error": "Database not available"}
     try:
@@ -957,7 +1184,7 @@ def add_to_cart(item: CartItem):
 
 
 @app.delete("/api/v1/cart/items/{product_id}")
-def remove_from_cart(product_id: str):
+def remove_from_cart(product_id: str, current_user: str = Depends(get_current_user)):
     if not cart_container:
         return {"error": "Database not available"}
     try:
@@ -979,7 +1206,7 @@ def remove_from_cart(product_id: str):
 
 
 @app.post("/api/v1/orders")
-def create_order():
+def create_order(current_user: str = Depends(get_current_user)):
     if not orders_container or not cart_container:
         return {"error": "Database not available"}
     try:
@@ -1009,7 +1236,7 @@ def create_order():
 
 
 @app.get("/api/v1/orders")
-def get_orders():
+def get_orders(current_user: str = Depends(get_current_user)):
     if not orders_container:
         return []
     try:
@@ -1023,3 +1250,4 @@ def get_orders():
         return items
     except Exception:
         return []
+

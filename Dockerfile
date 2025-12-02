@@ -16,3 +16,4 @@ EXPOSE 80
 # Start FastAPI with Uvicorn
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "80"]
 
+RUN pip install fastapi uvicorn azure-cosmos python-jose[cryptography]
