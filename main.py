@@ -1,0 +1,886 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+from azure.cosmos import CosmosClient, exceptions
+import os
+import uuid
+from datetime import datetime
+
+app = FastAPI(title="CloudMart API", version="1.1.0")
+
+BUILD_TIME = datetime.utcnow().isoformat()
+
+# CORS (for browser access if needed)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Cosmos DB configuration (will be provided later via environment variables)
+COSMOS_ENDPOINT = os.environ.get("COSMOS_ENDPOINT", "")
+COSMOS_KEY = os.environ.get("COSMOS_KEY", "")
+DATABASE_NAME = "cloudmart"
+
+client = None
+database = None
+products_container = None
+cart_container = None
+orders_container = None
+
+
+def init_cosmos():
+    """
+    Initialize Cosmos DB client and containers.
+    If env vars are not set, the app still runs, but DB-dependent endpoints return empty data.
+    """
+    global client, database, products_container, cart_container, orders_container
+
+    if not COSMOS_ENDPOINT or not COSMOS_KEY:
+        # running without DB (local/dev mode)
+        return
+
+    client = CosmosClient(COSMOS_ENDPOINT, COSMOS_KEY)
+    database = client.get_database_client(DATABASE_NAME)
+    products_container = database.get_container_client("products")
+    cart_container = database.get_container_client("cart")
+    orders_container = database.get_container_client("orders")
+
+    # Seed data if necessary
+    try:
+        items = list(
+            products_container.query_items(
+                "SELECT * FROM c", enable_cross_partition_query=True
+            )
+        )
+        if len(items) == 0:
+            seed_products()
+    except Exception:
+        # if Cosmos is misconfigured, just skip seeding
+        pass
+
+
+def seed_products():
+    """Seed demo products into the Cosmos DB 'products' container."""
+    products = [
+        {
+            "id": "1",
+            "name": "Wireless Headphones Pro",
+            "description": "Premium noise-cancelling wireless headphones with 30hr battery",
+            "category": "Electronics",
+            "price": 199.99,
+            "stock": 50,
+            "image": "🎧",
+        },
+        {
+            "id": "2",
+            "name": "Smart Watch Elite",
+            "description": "Advanced fitness tracking smartwatch with GPS",
+            "category": "Electronics",
+            "price": 299.99,
+            "stock": 30,
+            "image": "⌚",
+        },
+        {
+            "id": "3",
+            "name": "Running Shoes X1",
+            "description": "Lightweight breathable running shoes",
+            "category": "Sports",
+            "price": 89.99,
+            "stock": 100,
+            "image": "👟",
+        },
+        {
+            "id": "4",
+            "name": "Laptop Backpack Pro",
+            "description": "Water-resistant 15.6 inch laptop backpack",
+            "category": "Accessories",
+            "price": 49.99,
+            "stock": 75,
+            "image": "🎒",
+        },
+        {
+            "id": "5",
+            "name": "Coffee Maker Deluxe",
+            "description": "12-cup programmable coffee maker",
+            "category": "Home",
+            "price": 79.99,
+            "stock": 40,
+            "image": "☕",
+        },
+        {
+            "id": "6",
+            "name": "Yoga Mat Premium",
+            "description": "Extra thick eco-friendly yoga mat",
+            "category": "Sports",
+            "price": 35.99,
+            "stock": 60,
+            "image": "🧘",
+        },
+        {
+            "id": "7",
+            "name": "Bluetooth Speaker",
+            "description": "Portable waterproof bluetooth speaker",
+            "category": "Electronics",
+            "price": 59.99,
+            "stock": 45,
+            "image": "🔊",
+        },
+        {
+            "id": "8",
+            "name": "Desk Lamp LED",
+            "description": "Adjustable LED desk lamp with USB port",
+            "category": "Home",
+            "price": 29.99,
+            "stock": 80,
+            "image": "💡",
+        },
+    ]
+    for p in products:
+        try:
+            products_container.create_item(p)
+        except exceptions.CosmosResourceExistsError:
+            pass
+
+
+@app.on_event("startup")
+async def startup_event():
+    init_cosmos()
+
+
+class CartItem(BaseModel):
+    product_id: str
+    quantity: int = 1
+
+
+DEFAULT_USER = "demo_user"
+
+
+# -------------------- HTML FRONTEND -------------------- #
+
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>CloudMart - E-Commerce Platform</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+* { box-sizing:border-box; margin:0; padding:0; }
+body {
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);
+  min-height:100vh;
+  color:#111827;
+}
+.header {
+  background:rgba(15,23,42,0.85);
+  color:#e5e7eb;
+  padding:16px 24px;
+  position:sticky;
+  top:0;
+  z-index:10;
+}
+.header-content {
+  max-width:1100px;
+  margin:0 auto;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+}
+.logo {
+  font-size:24px;
+  font-weight:800;
+  letter-spacing:0.04em;
+}
+.logo span {
+  color:#a5b4fc;
+}
+.db-badge {
+  margin-left:8px;
+  font-size:12px;
+  padding:3px 8px;
+  border-radius:999px;
+  background:rgba(55,65,81,0.7);
+  border:1px solid rgba(129,140,248,0.5);
+}
+.cart-btn {
+  background:#4f46e5;
+  border:none;
+  color:white;
+  padding:8px 14px;
+  border-radius:999px;
+  font-size:14px;
+  display:flex;
+  align-items:center;
+  gap:8px;
+  cursor:pointer;
+}
+.cart-count {
+  background:white;
+  color:#4f46e5;
+  border-radius:999px;
+  padding:2px 8px;
+  font-size:12px;
+  font-weight:700;
+}
+.main {
+  max-width:1100px;
+  margin:24px auto 40px;
+  background:rgba(15,23,42,0.9);
+  border-radius:16px;
+  padding:20px;
+  box-shadow:0 25px 50px -12px rgba(0,0,0,0.7);
+  color:#e5e7eb;
+}
+.subtitle {
+  color:#9ca3af;
+  font-size:14px;
+  margin-top:4px;
+}
+.chip-row {
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  margin-top:16px;
+}
+.chip {
+  padding:6px 12px;
+  font-size:13px;
+  border-radius:999px;
+  border:1px solid rgba(156,163,175,0.5);
+  background:rgba(31,41,55,0.8);
+  color:#e5e7eb;
+  cursor:pointer;
+}
+.chip.active {
+  background:#f9fafb;
+  color:#111827;
+  border-color:transparent;
+}
+.product-grid {
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
+  gap:16px;
+  margin-top:20px;
+}
+.card {
+  background:linear-gradient(145deg,rgba(17,24,39,0.98),rgba(15,23,42,0.98));
+  border-radius:14px;
+  padding:14px 14px 16px;
+  border:1px solid rgba(55,65,81,0.9);
+  box-shadow:0 10px 30px rgba(0,0,0,0.6);
+}
+.card-header {
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+}
+.emoji {
+  font-size:32px;
+}
+.badge {
+  font-size:11px;
+  padding:3px 8px;
+  border-radius:999px;
+  background:rgba(55,65,81,0.8);
+  color:#e5e7eb;
+}
+.card-title {
+  margin-top:8px;
+  font-weight:600;
+  color:#f9fafb;
+}
+.card-desc {
+  margin-top:6px;
+  font-size:13px;
+  color:#9ca3af;
+}
+.card-footer {
+  margin-top:10px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+}
+.price {
+  font-weight:700;
+  color:#a5b4fc;
+}
+.stock {
+  font-size:11px;
+  color:#6b7280;
+}
+.btn {
+  padding:6px 10px;
+  border-radius:999px;
+  border:none;
+  font-size:13px;
+  cursor:pointer;
+  font-weight:500;
+}
+.btn-primary {
+  background:#4f46e5;
+  color:white;
+}
+.btn-primary:hover {
+  background:#4338ca;
+}
+.cart-modal-backdrop {
+  position:fixed;
+  inset:0;
+  background:rgba(15,23,42,0.8);
+  display:none;
+  align-items:flex-start;
+  justify-content:center;
+  padding-top:80px;
+  z-index:50;
+}
+.cart-modal {
+  background:#020617;
+  border-radius:16px;
+  padding:18px;
+  width:100%;
+  max-width:420px;
+  border:1px solid rgba(75,85,99,0.8);
+}
+.cart-header-row {
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+}
+.cart-items {
+  margin-top:12px;
+  max-height:300px;
+  overflow-y:auto;
+}
+.cart-item {
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  padding:8px 0;
+  border-bottom:1px solid rgba(31,41,55,0.9);
+}
+.cart-product {
+  font-size:14px;
+}
+.cart-qty-controls {
+  display:flex;
+  align-items:center;
+  gap:6px;
+}
+.qty-btn {
+  width:22px;
+  height:22px;
+  border-radius:999px;
+  border:none;
+  background:#1f2937;
+  color:#e5e7eb;
+  cursor:pointer;
+}
+.cart-total-row {
+  margin-top:10px;
+  display:flex;
+  justify-content:space-between;
+  font-weight:600;
+}
+.toast {
+  position:fixed;
+  bottom:18px;
+  right:18px;
+  padding:10px 14px;
+  border-radius:10px;
+  background:#22c55e;
+  color:#052e16;
+  font-size:13px;
+  display:none;
+  z-index:60;
+}
+.toast.error {
+  background:#f97373;
+  color:#450a0a;
+}
+small.build {
+  display:block;
+  margin-top:10px;
+  font-size:11px;
+  color:#6b7280;
+}
+</style>
+</head>
+<body>
+<header class="header">
+  <div class="header-content">
+    <div>
+      <div class="logo">Cloud<span>Mart</span><span class="db-badge">🗄️ Cosmos DB</span></div>
+      <div class="subtitle">CI/CD: GitHub Actions → Docker Hub → Azure Container Instances</div>
+    </div>
+    <button class="cart-btn" onclick="openCart()">🛒 Cart <span id="cartCount" class="cart-count">0</span></button>
+  </div>
+</header>
+
+<main class="main">
+  <div style="display:flex;justify-content:space-between;align-items:flex-end;gap:10px;">
+    <div>
+      <h2 style="font-size:18px;font-weight:600;">Products</h2>
+      <p style="font-size:13px;color:#9ca3af;margin-top:4px;">
+        Browse products from Cosmos DB, add to cart, and place orders.
+      </p>
+    </div>
+    <div style="font-size:11px;color:#6b7280;text-align:right;">
+      <div id="healthStatus">Checking health…</div>
+      <small class="build">Build: <span id="buildTime"></span></small>
+    </div>
+  </div>
+
+  <div class="chip-row" id="categoryChips">
+  </div>
+
+  <div class="product-grid" id="productGrid">
+  </div>
+</main>
+
+<div class="cart-modal-backdrop" id="cartModal">
+  <div class="cart-modal">
+    <div class="cart-header-row">
+      <h3>Shopping Cart</h3>
+      <button class="qty-btn" onclick="closeCart()">✕</button>
+    </div>
+    <div class="cart-items" id="cartItems"></div>
+    <div class="cart-total-row">
+      <span>Total</span>
+      <span id="cartTotal">$0.00</span>
+    </div>
+    <div style="margin-top:12px;display:flex;justify-content:flex-end;gap:8px;">
+      <button class="btn" onclick="closeCart()">Close</button>
+      <button class="btn btn-primary" onclick="placeOrder()">Place Order</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+let products = [];
+let categories = [];
+let cart = [];
+
+async function fetchJSON(url, options) {
+  const res = await fetch(url, options || {});
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  return res.json();
+}
+
+async function loadHealth() {
+  try {
+    const data = await fetchJSON("/health");
+    document.getElementById("healthStatus").textContent =
+      data.status === "healthy"
+        ? "Status: healthy (" + data.db_status + ")"
+        : "Status: " + data.status;
+    document.getElementById("buildTime").textContent = data.build_time || "";
+  } catch (e) {
+    document.getElementById("healthStatus").textContent = "Status: unreachable";
+  }
+}
+
+async function init() {
+  await loadHealth();
+  try {
+    products = await fetchJSON("/api/v1/products");
+    categories = await fetchJSON("/api/v1/categories");
+    cart = await fetchJSON("/api/v1/cart");
+  } catch (e) {
+    showToast("Failed to load data from API", true);
+  }
+  renderCategories();
+  renderProducts();
+  updateCartCount();
+}
+
+function renderCategories() {
+  const container = document.getElementById("categoryChips");
+  container.innerHTML = "";
+  const allChip = document.createElement("button");
+  allChip.className = "chip active";
+  allChip.textContent = "All products";
+  allChip.onclick = () => filterCategory(null);
+  container.appendChild(allChip);
+
+  categories.forEach(cat => {
+    const chip = document.createElement("button");
+    chip.className = "chip";
+    chip.textContent = cat;
+    chip.onclick = () => filterCategory(cat);
+    container.appendChild(chip);
+  });
+}
+
+function renderProducts(filtered) {
+  const grid = document.getElementById("productGrid");
+  grid.innerHTML = "";
+  const list = filtered || products;
+
+  list.forEach(p => {
+    const card = document.createElement("article");
+    card.className = "card";
+
+    card.innerHTML = `
+      <div class="card-header">
+        <div class="emoji">${p.image || "🛒"}</div>
+        <span class="badge">${p.category}</span>
+      </div>
+      <div class="card-title">${p.name}</div>
+      <div class="card-desc">${p.description}</div>
+      <div class="card-footer">
+        <div>
+          <div class="price">$${p.price.toFixed(2)}</div>
+          <div class="stock">${p.stock} in stock</div>
+        </div>
+        <button class="btn btn-primary" data-id="${p.id}">Add to cart</button>
+      </div>
+    `;
+
+    const btn = card.querySelector("button");
+    btn.onclick = () => addToCart(p.id, 1);
+
+    grid.appendChild(card);
+  });
+}
+
+function filterCategory(category) {
+  const chips = document.querySelectorAll(".chip");
+  chips.forEach(c => c.classList.remove("active"));
+  if (!category) {
+    chips[0].classList.add("active");
+    renderProducts();
+    return;
+  }
+  chips.forEach(c => {
+    if (c.textContent === category) c.classList.add("active");
+  });
+  renderProducts(products.filter(p => p.category === category));
+}
+
+function updateCartCount() {
+  document.getElementById("cartCount").textContent = cart.length;
+}
+
+function openCart() {
+  renderCart();
+  document.getElementById("cartModal").style.display = "flex";
+}
+
+function closeCart() {
+  document.getElementById("cartModal").style.display = "none";
+}
+
+function renderCart() {
+  const container = document.getElementById("cartItems");
+  container.innerHTML = "";
+  let total = 0;
+
+  cart.forEach(item => {
+    const product = products.find(p => p.id === item.product_id);
+    if (!product) return;
+    const lineTotal = product.price * item.quantity;
+    total += lineTotal;
+
+    const row = document.createElement("div");
+    row.className = "cart-item";
+    row.innerHTML = `
+      <div class="cart-product">
+        <div>${product.name}</div>
+        <small style="color:#9ca3af;">$${product.price.toFixed(2)} each</small>
+      </div>
+      <div class="cart-qty-controls">
+        <button class="qty-btn" data-action="dec">-</button>
+        <span>${item.quantity}</span>
+        <button class="qty-btn" data-action="inc">+</button>
+        <button class="qty-btn" data-action="remove">✕</button>
+      </div>
+    `;
+
+    const [decBtn, , incBtn, removeBtn] = row.querySelectorAll(".qty-btn");
+    decBtn.onclick = () =>
+      updateCartQuantity(item.product_id, Math.max(1, item.quantity - 1));
+    incBtn.onclick = () =>
+      updateCartQuantity(item.product_id, item.quantity + 1);
+    removeBtn.onclick = () => removeFromCart(item.product_id);
+
+    container.appendChild(row);
+  });
+
+  document.getElementById("cartTotal").textContent = "$" + total.toFixed(2);
+}
+
+async function addToCart(productId, quantity) {
+  try {
+    await fetchJSON("/api/v1/cart/items", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ product_id: productId, quantity }),
+    });
+    cart = await fetchJSON("/api/v1/cart");
+    updateCartCount();
+    showToast("Saved to Cosmos DB!");
+  } catch (e) {
+    showToast("Failed to update cart", true);
+  }
+}
+
+async function updateCartQuantity(productId, quantity) {
+  await addToCart(productId, quantity);
+  renderCart();
+}
+
+async function removeFromCart(productId) {
+  try {
+    await fetchJSON("/api/v1/cart/items/" + productId, {
+      method: "DELETE",
+    });
+    cart = await fetchJSON("/api/v1/cart");
+    updateCartCount();
+    renderCart();
+    showToast("Removed from cart");
+  } catch (e) {
+    showToast("Failed to remove item", true);
+  }
+}
+
+async function placeOrder() {
+  if (cart.length === 0) {
+    showToast("Cart is empty", true);
+    return;
+  }
+  try {
+    const order = await fetchJSON("/api/v1/orders", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    cart = [];
+    updateCartCount();
+    closeCart();
+    showToast("Order saved to Cosmos DB!");
+    console.log("Order:", order);
+  } catch (e) {
+    showToast("Failed to place order", true);
+  }
+}
+
+let toastTimeout;
+function showToast(message, isError) {
+  const t = document.getElementById("toast");
+  t.textContent = message;
+  t.classList.toggle("error", !!isError);
+  t.style.display = "block";
+  clearTimeout(toastTimeout);
+  toastTimeout = setTimeout(() => (t.style.display = "none"), 3000);
+}
+
+init();
+</script>
+</body>
+</html>
+"""
+
+
+# -------------------- ROUTES -------------------- #
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return HTML_TEMPLATE
+
+
+@app.get("/health")
+def health():
+    db_status = "connected" if client else "disconnected"
+    return {
+        "status": "healthy",
+        "service": "cloudmart-api",
+        "version": "1.1.0",
+        "build_time": BUILD_TIME,
+        "database": "cosmos-db",
+        "db_status": db_status,
+        "deployed_via": "local-dev",
+    }
+
+
+@app.get("/api/v1/products")
+def list_products(category: str | None = None):
+    if not products_container:
+        # running without DB
+        return []
+    try:
+        if category:
+            query = "SELECT * FROM c WHERE c.category = @category"
+            items = list(
+                products_container.query_items(
+                    query,
+                    parameters=[{"name": "@category", "value": category}],
+                    enable_cross_partition_query=True,
+                )
+            )
+        else:
+            items = list(
+                products_container.query_items(
+                    "SELECT * FROM c", enable_cross_partition_query=True
+                )
+            )
+        return items
+    except Exception:
+        return []
+
+
+@app.get("/api/v1/products/{product_id}")
+def get_product(product_id: str):
+    if not products_container:
+        raise HTTPException(status_code=503, detail="Database not available")
+    try:
+        items = list(
+            products_container.query_items(
+                "SELECT * FROM c WHERE c.id = @id",
+                parameters=[{"name": "@id", "value": product_id}],
+                enable_cross_partition_query=True,
+            )
+        )
+        if items:
+            return items[0]
+        raise HTTPException(status_code=404, detail="Product not found")
+    except exceptions.CosmosHttpResponseError:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+
+@app.get("/api/v1/categories")
+def get_categories():
+    if not products_container:
+        return []
+    try:
+        items = list(
+            products_container.query_items(
+                "SELECT DISTINCT c.category FROM c",
+                enable_cross_partition_query=True,
+            )
+        )
+        return [item["category"] for item in items]
+    except Exception:
+        return []
+
+
+@app.get("/api/v1/cart")
+def get_cart():
+    if not cart_container:
+        return []
+    try:
+        items = list(
+            cart_container.query_items(
+                "SELECT * FROM c WHERE c.user_id = @user_id",
+                parameters=[{"name": "@user_id", "value": DEFAULT_USER}],
+                enable_cross_partition_query=True,
+            )
+        )
+        return items
+    except Exception:
+        return []
+
+
+@app.post("/api/v1/cart/items")
+def add_to_cart(item: CartItem):
+    if not cart_container:
+        return {"error": "Database not available"}
+    try:
+        existing = list(
+            cart_container.query_items(
+                "SELECT * FROM c WHERE c.user_id = @user_id AND c.product_id = @product_id",
+                parameters=[
+                    {"name": "@user_id", "value": DEFAULT_USER},
+                    {"name": "@product_id", "value": item.product_id},
+                ],
+                enable_cross_partition_query=True,
+            )
+        )
+        if existing:
+            cart_item = existing[0]
+            cart_item["quantity"] = item.quantity
+            cart_container.upsert_item(cart_item)
+        else:
+            cart_item = {
+                "id": str(uuid.uuid4()),
+                "user_id": DEFAULT_USER,
+                "product_id": item.product_id,
+                "quantity": item.quantity,
+            }
+            cart_container.create_item(cart_item)
+        return {"message": "Saved to Cosmos DB"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.delete("/api/v1/cart/items/{product_id}")
+def remove_from_cart(product_id: str):
+    if not cart_container:
+        return {"error": "Database not available"}
+    try:
+        items = list(
+            cart_container.query_items(
+                "SELECT * FROM c WHERE c.user_id = @user_id AND c.product_id = @product_id",
+                parameters=[
+                    {"name": "@user_id", "value": DEFAULT_USER},
+                    {"name": "@product_id", "value": product_id},
+                ],
+                enable_cross_partition_query=True,
+            )
+        )
+        for item in items:
+            cart_container.delete_item(item["id"], partition_key=DEFAULT_USER)
+        return {"message": "Removed from Cosmos DB"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/v1/orders")
+def create_order():
+    if not orders_container or not cart_container:
+        return {"error": "Database not available"}
+    try:
+        cart_items = list(
+            cart_container.query_items(
+                "SELECT * FROM c WHERE c.user_id = @user_id",
+                parameters=[{"name": "@user_id", "value": DEFAULT_USER}],
+                enable_cross_partition_query=True,
+            )
+        )
+        order = {
+            "id": str(uuid.uuid4()),
+            "user_id": DEFAULT_USER,
+            "items": [
+                {"product_id": i["product_id"], "quantity": i["quantity"]}
+                for i in cart_items
+            ],
+            "status": "confirmed",
+            "created_at": datetime.utcnow().isoformat(),
+        }
+        orders_container.create_item(order)
+        for item in cart_items:
+            cart_container.delete_item(item["id"], partition_key=DEFAULT_USER)
+        return order
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/v1/orders")
+def get_orders():
+    if not orders_container:
+        return []
+    try:
+        items = list(
+            orders_container.query_items(
+                "SELECT * FROM c WHERE c.user_id = @user_id",
+                parameters=[{"name": "@user_id", "value": DEFAULT_USER}],
+                enable_cross_partition_query=True,
+            )
+        )
+        return items
+    except Exception:
+        return []
