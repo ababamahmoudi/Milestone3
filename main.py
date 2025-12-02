@@ -458,6 +458,25 @@ small.build {
   </div>
 </div>
 
+<div class="cart-modal-backdrop" id="cartModal">
+  <div class="cart-modal">
+    <div class="cart-header-row">
+      <h3>Shopping Cart</h3>
+      <button class="qty-btn" onclick="closeCart()">✕</button>
+    </div>
+    <div class="cart-items" id="cartItems"></div>
+    <div class="cart-total-row">
+      <span>Total</span>
+      <span id="cartTotal">$0.00</span>
+    </div>
+    <div style="margin-top:12px;display:flex;justify-content:flex-end;gap:8px;">
+      <button class="btn" onclick="closeCart()">Close</button>
+      <button class="btn btn-primary" onclick="placeOrder()">Place Order</button>
+    </div>
+  </div>
+</div>
+
+
 <div class="toast" id="toast"></div>
 
 <script>
